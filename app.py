@@ -1,73 +1,107 @@
 import streamlit as st
 import pandas as pd
 import io, re, time
+from urllib.parse import urlparse
 from curl_cffi import requests
-from google import genai
 
-# Page Setup
+# Page Configuration
 st.set_page_config(page_title="CoachStats AI", page_icon="🏀", layout="wide")
 st.title("🏀 Turnkey High School Stat Importer")
-st.write("Paste a MaxPreps stats link below to automatically consolidate rosters and career stats for Google AI Studio.")
+st.write("Extract historical roster and performance tables from MaxPreps (2005–06 to Present) for Google AI Studio.")
 
-# User Inputs
-team_url = st.text_input("MaxPreps Team Stats URL:", placeholder="https://www.maxpreps.com/nc/greensboro/page-pirates/basketball/stats/")
+# Dynamically generate all 22 seasons: ['05-06', '06-07', ..., '26-27']
+ALL_SEASONS = [f"{str(y)[-2:]}-{str(y+1)[-2:]}" for y in range(2005, 2027)]
 
-col1, col2 = st.columns(2)
-with col1:
-    start_year = st.selectbox("Start Season", ["20-21", "21-22", "22-23", "23-24", "24-25", "25-26"], index=1)
-with col2:
-    end_year = st.selectbox("End Season", ["24-25", "25-26", "26-27"], index=1)
+def clean_maxpreps_url(url):
+    """Strips #Player, query tags, and season numbers to build a clean multi-year template."""
+    parsed = urlparse(url.strip())
+    path = parsed.path.rstrip('/')
+    parts = [p for p in path.split('/') if p]
+    
+    # Remove existing season indicators (e.g., 25-26) and trailing 'stats'
+    filtered = [p for p in parts if not re.match(r'^\d{2}-\d{2}$', p) and p != 'stats']
+    base_path = '/'.join(filtered)
+    template = f"https://www.maxpreps.com/{base_path}/{{season}}/stats/"
+    
+    # Extract clean school name
+    school = filtered[2].replace('-', ' ').title() if len(filtered) > 2 else "Team"
+    return template, school
 
-if st.button("🚀 Fetch All Seasons", type="primary"):
+# Input Fields
+team_url = st.text_input(
+    "MaxPreps Team Stats URL:",
+    value="https://www.maxpreps.com/nc/high-point/southwest-guilford-cowboys/basketball/girls/stats/"
+)
+
+# Range Options
+fetch_all = st.checkbox("⚡ Fetch entire 20+ year archive (05-06 through 26-27)", value=True)
+
+if not fetch_all:
+    col1, col2 = st.columns(2)
+    with col1:
+        start_year = st.selectbox("Start Season", ALL_SEASONS, index=0) # defaults to 05-06
+    with col2:
+        end_year = st.selectbox("End Season", ALL_SEASONS, index=len(ALL_SEASONS)-1) # defaults to 26-27
+else:
+    start_year = "05-06"
+    end_year = "26-27"
+
+if st.button("🚀 Fetch Seasons", type="primary"):
     if not team_url:
         st.warning("Please enter a valid MaxPreps URL.")
     else:
-        with st.spinner("Scanning historical seasons in the background..."):
-            # Clean URL
-            clean_base = re.sub(r'/\d{2}-\d{2}/', '/', team_url.rstrip('/'))
-            template_url = (clean_base[:-6] if clean_base.endswith('/stats') else clean_base) + "/{season}/stats/"
-            school_name = template_url.split('/')[5].replace('-', ' ').title()
+        template_url, school_name = clean_maxpreps_url(team_url)
+        st.info(f"Targeting: **{school_name}** | Base URL: `{template_url.format(season='[SEASON]')}`")
 
-            # Generate season list
-            all_years = ["15-16", "16-17", "17-18", "18-19", "19-20", "20-21", "21-22", "22-23", "23-24", "24-25", "25-26", "26-27"]
+        s_idx = ALL_SEASONS.index(start_year)
+        e_idx = ALL_SEASONS.index(end_year)
+        selected_seasons = ALL_SEASONS[s_idx:e_idx+1]
+
+        frames = []
+        progress_bar = st.progress(0)
+        status_box = st.empty()
+
+        for i, s in enumerate(selected_seasons):
+            target = template_url.format(season=s)
+            status_box.write(f"⏳ Scanning season **{s}**...")
+
             try:
-                s_idx = all_years.index(start_year)
-                e_idx = all_years.index(end_year)
-                selected_seasons = all_years[s_idx:e_idx+1]
-            except ValueError:
-                selected_seasons = ["23-24", "24-25", "25-26"]
-
-            frames = []
-            for s in selected_seasons:
-                target = template_url.format(season=s)
                 res = requests.get(target, impersonate="chrome120")
-                if res.status_code == 200 and "<table" in res.text:
-                    try:
-                        tables = pd.read_html(io.StringIO(res.text))
-                        if tables:
-                            df = tables[0]
-                            df.insert(0, "Season", s)
-                            df.insert(0, "School", school_name)
-                            frames.append(df)
-                    except Exception:
-                        pass
-                time.sleep(0.3)
+                if res.status_code == 200:
+                    tables = pd.read_html(io.StringIO(res.text))
+                    if tables:
+                        df = tables[0]
+                        df.insert(0, "Season", s)
+                        df.insert(0, "School", school_name)
+                        frames.append(df)
+                        st.write(f"✓ **{s}**: Ingested ({len(df)} players)")
+                    else:
+                        st.write(f"– **{s}**: Page loaded, but no player stats table entered")
+                elif res.status_code == 404:
+                    st.write(f"– **{s}**: No season page exists (404)")
+                else:
+                    st.write(f"– **{s}**: Server status {res.status_code}")
+            except Exception:
+                st.write(f"– **{s}**: Skipped (no table)")
 
-            if frames:
-                master_df = pd.concat(frames, ignore_index=True)
-                st.success(f"✓ Successfully aggregated {len(frames)} active seasons for {school_name}!")
-                
-                # Show Preview
-                st.dataframe(master_df.head(10))
+            progress_bar.progress((i + 1) / len(selected_seasons))
+            time.sleep(0.3)
 
-                # Download Button for Coaches
-                csv_data = master_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Master CSV for AI Studio",
-                    data=csv_data,
-                    file_name=f"{school_name.replace(' ', '_')}_stats.csv",
-                    mime="text/csv"
-                )
-            else:
-                st.error("No player stat tables were found for the selected seasons. (Note: Many high school coaches only submit scores, not individual player stats).")
+        status_box.empty()
+
+        if frames:
+            master_df = pd.concat(frames, ignore_index=True)
+            st.success(f"🎉 Successfully captured {len(frames)} active seasons for {school_name}!")
+            
+            st.dataframe(master_df)
+
+            csv_data = master_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Master 20-Year CSV for Google AI Studio",
+                data=csv_data,
+                file_name=f"{school_name.replace(' ', '_')}_2005_to_Present.csv",
+                mime="text/csv"
+            )
+        else:
+            st.error("No player stats found across the selected seasons.")
 
