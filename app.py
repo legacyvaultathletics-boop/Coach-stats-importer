@@ -11,7 +11,6 @@ st.write("Paste any MaxPreps team link below to build a verified dataset for Goo
 
 ALL_SEASONS = [f"{str(y)[-2:]}-{str(y+1)[-2:]}" for y in range(2005, 2027)]
 
-# Tabs to strip from user input to find the root team path
 STOP_WORDS = {
     'stats', 'schedule', 'roster', 'standings', 'rankings', 
     'photos', 'videos', 'news', 'history', 'media', 'home'
@@ -25,7 +24,6 @@ def clean_maxpreps_url(url):
     path = parsed.path.rstrip('/')
     parts = [p for p in path.split('/') if p]
     
-    # Strip out season numbers and sub-tabs
     filtered = [
         p for p in parts 
         if not re.match(r'^\d{2}-\d{2}$', p) and p.lower() not in STOP_WORDS
@@ -40,9 +38,20 @@ def clean_maxpreps_url(url):
     school = filtered[2].replace('-', ' ').title()
     return stats_template, history_url, school
 
+# Helper function to flatten MaxPreps MultiIndex headers
+def flatten_maxpreps_table(df):
+    if isinstance(df.columns, pd.MultiIndex):
+        new_cols = []
+        for col in df.columns:
+            # Pick the lowest level label (e.g., 'Name', 'GP', 'Pts')
+            clean_parts = [str(x).strip() for x in col if str(x).strip() and not str(x).startswith('Unnamed')]
+            new_cols.append(clean_parts[-1] if clean_parts else str(col[-1]))
+        df.columns = new_cols
+    return df
+
 team_url = st.text_input(
     "Paste Any MaxPreps Team URL (Stats, Roster, or Schedule page):",
-    placeholder="https://www.maxpreps.com/va/virginia-beach/bayside-marlins/football/"
+    placeholder="https://www.maxpreps.com/va/virginia-beach/bayside-marlins/basketball/"
 )
 
 col_opt1, col_opt2, col_opt3 = st.columns(3)
@@ -71,47 +80,42 @@ if st.button("🚀 Fetch & Validate Stats & Coaches", type="primary"):
         st.info(f"Targeting: **{school_name}**")
 
         # -------------------------------------------------------------
-        # STEP 1: SCRAPE COACHING HISTORY (/history/)
+        # 1. COACHING HISTORY PARSER
         # -------------------------------------------------------------
         coaches_df = pd.DataFrame()
         if fetch_coaches:
-            st.write("⏳ Extracting Head Coaching History from MaxPreps `/history/`...")
+            st.write("⏳ Scanning MaxPreps `/history/` for Head Coaching Records...")
             try:
                 h_res = requests.get(history_url, impersonate="chrome120")
                 if h_res.status_code == 200:
-                    h_tables = pd.read_html(io.StringIO(h_res.text))
-                    # MaxPreps history table typically has 'Season' and 'Head Coach'
-                    for ht in h_tables:
-                        cols = [str(c).lower() for c in ht.columns]
-                        if any("coach" in c for c in cols):
-                            coaches_df = ht
-                            break
+                    soup = BeautifulSoup(h_res.text, 'html.parser')
+                    coach_records = []
                     
-                    # Fallback parser if HTML table isn't standard <table>
-                    if coaches_df.empty:
-                        soup = BeautifulSoup(h_res.text, 'html.parser')
-                        rows = []
-                        for li in soup.find_all(['li', 'tr', 'div'], text=re.compile(r'Head Coach:', re.I)):
-                            text = li.get_text(separator=' ')
-                            m_yr = re.search(r'(\d{4}[–-]\d{2,4})', text)
+                    for el in soup.find_all(['li', 'div', 'tr', 'p']):
+                        text = el.get_text(separator=' ').strip()
+                        if 'Head Coach:' in text or 'Overall Record:' in text or 'W-L' in text:
+                            m_yr = re.search(r'(20\d{2}[–-]\d{2,4}|\d{2}[–-]\d{2})', text)
                             m_coach = re.search(r'Head Coach:\s*([A-Za-z\s\.\'-]+)', text)
-                            if m_yr and m_coach:
-                                rows.append({'Season': m_yr.group(1), 'Head Coach': m_coach.group(1).strip()})
-                        if rows:
-                            coaches_df = pd.DataFrame(rows)
-
-                    if not coaches_df.empty:
-                        coaches_df.insert(0, "School", school_name)
-                        st.success(f"✅ Captured {len(coaches_df)} seasons of Head Coaching history!")
+                            m_record = re.search(r'Overall Record:\s*(\d+[-–]\d+)', text)
+                            if m_yr:
+                                coach_records.append({
+                                    "School": school_name,
+                                    "Season": m_yr.group(1),
+                                    "Head Coach": m_coach.group(1).strip() if m_coach else "Not Listed",
+                                    "Record": m_record.group(1).strip() if m_record else "—"
+                                })
+                    if coach_records:
+                        coaches_df = pd.DataFrame(coach_records).drop_duplicates(subset=['Season'])
+                        st.success(f"✅ Captured {len(coaches_df)} seasons of coaching history!")
                     else:
-                        st.warning("– Could not locate structured coaching table on `/history/`.")
+                        st.info("– No coaching roster published on `/history/` for this program.")
                 else:
-                    st.warning(f"– Could not reach history page (Status {h_res.status_code}).")
+                    st.info(f"– History page returned status {h_res.status_code}.")
             except Exception as e:
-                st.warning(f"⚠️ Coaching history extraction error: {e}")
+                st.info(f"– Coaching scan note: {e}")
 
         # -------------------------------------------------------------
-        # STEP 2: SCRAPE PLAYER BOX SCORES (/stats/)
+        # 2. PLAYER STATS SCANNER (With MultiIndex Flattener)
         # -------------------------------------------------------------
         s_idx = ALL_SEASONS.index(start_year)
         e_idx = ALL_SEASONS.index(end_year)
@@ -128,32 +132,57 @@ if st.button("🚀 Fetch & Validate Stats & Coaches", type="primary"):
             try:
                 res = requests.get(target, impersonate="chrome120")
                 if res.status_code == 200:
-                    tables = pd.read_html(io.StringIO(res.text))
-                    player_tables = [t for t in tables if "Name" in t.columns or "GP" in t.columns]
-                    
-                    if player_tables:
-                        season_df = player_tables[0]
-                        for next_t in player_tables[1:]:
-                            keys = [c for c in ["#", "Name"] if c in season_df.columns and c in next_t.columns]
-                            if keys:
-                                overlap = [c for c in next_t.columns if c in season_df.columns and c not in keys]
-                                next_t_clean = next_t.drop(columns=overlap)
-                                season_df = pd.merge(season_df, next_t_clean, on=keys, how="outer")
+                    try:
+                        raw_tables = pd.read_html(io.StringIO(res.text))
+                        player_tables = []
+                        for rt in raw_tables:
+                            cleaned_t = flatten_maxpreps_table(rt)
+                            # Match if any column contains 'Name' or 'GP' (case-insensitive)
+                            col_str = " ".join([str(c).lower() for c in cleaned_t.columns])
+                            if "name" in col_str or "gp" in col_str or "pts" in col_str:
+                                player_tables.append(cleaned_t)
+                        
+                        if player_tables:
+                            season_df = player_tables[0]
+                            for next_t in player_tables[1:]:
+                                keys = [c for c in ["#", "Name"] if c in season_df.columns and c in next_t.columns]
+                                if not keys:
+                                    keys = [c for c in season_df.columns if "name" in str(c).lower() and c in next_t.columns]
+                                if keys:
+                                    overlap = [c for c in next_t.columns if c in season_df.columns and c not in keys]
+                                    next_t_clean = next_t.drop(columns=overlap)
+                                    season_df = pd.merge(season_df, next_t_clean, on=keys, how="outer")
 
-                        if "Name" in season_df.columns:
-                            season_df["Name"] = season_df["Name"].astype(str)
-                            if exclude_totals:
-                                season_df = season_df[~season_df["Name"].str.contains("Season Totals|Team Totals", case=False, na=False)]
+                            # Name & Class cleanup
+                            name_col = None
+                            for c in season_df.columns:
+                                if "name" in str(c).lower():
+                                    name_col = c
+                                    break
                             
-                            extracted_class = season_df["Name"].str.extract(r'\((Fr|So|Jr|Sr)\)', expand=False)
-                            season_df["Name"] = season_df["Name"].str.replace(r'\s*\((Fr|So|Jr|Sr)\)', '', regex=True).str.strip()
-                            season_df.insert(1, "Class", extracted_class.fillna("Unknown"))
+                            if name_col:
+                                season_df[name_col] = season_df[name_col].astype(str)
+                                if exclude_totals:
+                                    season_df = season_df[~season_df[name_col].str.contains("Season Totals|Team Totals", case=False, na=False)]
+                                
+                                extracted_class = season_df[name_col].str.extract(r'\((Fr|So|Jr|Sr)\)', expand=False)
+                                season_df[name_col] = season_df[name_col].str.replace(r'\s*\((Fr|So|Jr|Sr)\)', '', regex=True).str.strip()
+                                season_df.insert(1, "Class", extracted_class.fillna("Unknown"))
 
-                        season_df.insert(0, "Season", s)
-                        season_df.insert(0, "School", school_name)
-                        frames.append(season_df)
+                            season_df.insert(0, "Season", s)
+                            season_df.insert(0, "School", school_name)
+                            frames.append(season_df)
+                            st.write(f"✅ **{s}**: Captured {len(season_df)} players ({len(player_tables)} stat tables merged)")
+                        else:
+                            st.write(f"– **{s}**: Page loaded, no player box scores entered by coach.")
+                    except ValueError:
+                        st.write(f"– **{s}**: No stats tables published.")
+                elif res.status_code == 404:
+                    st.write(f"– **{s}**: Season archive not found on MaxPreps (404).")
+                else:
+                    st.write(f"– **{s}**: Server responded with status {res.status_code}.")
             except Exception as e:
-                pass
+                st.write(f"⚠️ **{s}** Error: {e}")
 
             progress_bar.progress((i + 1) / len(selected_seasons))
             time.sleep(0.3)
@@ -161,38 +190,36 @@ if st.button("🚀 Fetch & Validate Stats & Coaches", type="primary"):
         status_box.empty()
 
         # -------------------------------------------------------------
-        # STEP 3: DISPLAY AND DOWNLOAD BUTTONS
+        # 3. DISPLAY RESULTS & DOWNLOAD BUTTONS
         # -------------------------------------------------------------
-        if frames or not coaches_df.empty:
-            st.success("🎉 Extraction & Validation Complete!")
+        if not coaches_df.empty:
+            st.subheader("📋 Head Coaching Lineage")
+            st.dataframe(coaches_df)
+            c_csv = coaches_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Coaching Ledger CSV",
+                data=c_csv,
+                file_name=f"{school_name.replace(' ', '_')}_Coaches_History.csv",
+                mime="text/csv"
+            )
 
-            if not coaches_df.empty:
-                st.subheader("📋 Head Coaching Lineage")
-                st.dataframe(coaches_df)
-                c_csv = coaches_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Coaching Ledger CSV",
-                    data=c_csv,
-                    file_name=f"{school_name.replace(' ', '_')}_Coaches_History.csv",
-                    mime="text/csv"
-                )
+        if frames:
+            master_df = pd.concat(frames, ignore_index=True)
+            st.success("🎉 Player Stats Extraction Complete!")
+            st.subheader("🏃 Player Statistics")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Active Seasons Captured", f"{len(frames)} / {len(selected_seasons)}")
+            m2.metric("Total Player-Season Rows", len(master_df))
+            m3.metric("Stat Columns Merged", len(master_df.columns))
+            st.dataframe(master_df)
 
-            if frames:
-                master_df = pd.concat(frames, ignore_index=True)
-                st.subheader("🏃 Player Statistics")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Active Seasons Captured", f"{len(frames)} / {len(selected_seasons)}")
-                m2.metric("Total Player-Season Rows", len(master_df))
-                m3.metric("Stat Columns Merged", len(master_df.columns))
-                st.dataframe(master_df)
-
-                p_csv = master_df.to_csv(index=False).encode('utf-8')
-                st.download_button(
-                    label="📥 Download Verified Player Stats CSV",
-                    data=p_csv,
-                    file_name=f"{school_name.replace(' ', '_')}_Verified_Stats.csv",
-                    mime="text/csv"
-                )
-        else:
-            st.error("No player stats or coaching records found.")
+            p_csv = master_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Download Verified Player Stats CSV for AI Studio",
+                data=p_csv,
+                file_name=f"{school_name.replace(' ', '_')}_Verified_Stats.csv",
+                mime="text/csv"
+            )
+        elif coaches_df.empty:
+            st.error("No player stats or coaching records found on MaxPreps for this team.")
 
